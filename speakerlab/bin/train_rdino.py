@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.distributed as dist
 import speakerlab.utils.utils as utils
 import speakerlab.utils.utils_rdino as utils_rdino
-from speakerlab.utils.config import build_config
+from speakerlab.utils.config import build_config,build_configg
 from speakerlab.utils.builder import build
 
 parser = argparse.ArgumentParser(description='Regularized DINO Framework Training')
@@ -25,7 +25,7 @@ parser.add_argument('--gpu', nargs='+', help='GPU id to use.')
 def main():
     args, overrides = parser.parse_known_args(sys.argv[1:])
     config = build_config(args.config, overrides, True)
-
+    config2= build_configg(args.config, overrides, True)
     # DDP
     rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
@@ -55,22 +55,27 @@ def main():
     # Load models
     student = build('student_model', config)
     teacher = build('teacher_model', config)
+    original = build('original_model', config2)  # Add the Original model
 
     # synchronize batch norms
     student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
     teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
+    original = nn.SyncBatchNorm.convert_sync_batchnorm(original)
     student.cuda()
     teacher.cuda()
+    original.cuda()
 
     # DDP wrapper
     teacher = nn.parallel.DistributedDataParallel(teacher)
     student = nn.parallel.DistributedDataParallel(student)
-
+    original = nn.parallel.DistributedDataParallel(original)
     # teacher and student start with the same weights
     teacher.load_state_dict(student.state_dict())
 
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
+        p.requires_grad = False
+    for p in original.parameters():
         p.requires_grad = False
     print("Student and teacher are using the same network architecture but different parameters.")
 
@@ -149,11 +154,12 @@ def main():
                 f.write(json.dumps(log_stats) + "\n")
 
 
-def train_one_epoch(student, teacher, dino_loss, regularized_loss, train_loader, optimizer, lr_schedule, \
+def train_one_epoch(student, teacher, original, dino_loss, regularized_loss, train_loader, optimizer, lr_schedule, \
                     wd_schedule, momentum_schedule, epoch, config):
 
     teacher.train()
     student.train()
+    original.train()  # Set the Original network to train mode
 
     metric_logger = utils_rdino.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch+1, config.epochs)
@@ -196,9 +202,14 @@ def train_one_epoch(student, teacher, dino_loss, regularized_loss, train_loader,
             later_lambd = numpy.linspace(config.lambd, config.lambd, 60)
             lambd_sche = numpy.concatenate((begin_lambd, later_lambd), axis=0)
             lambd_cur = lambd_sche[epoch]
+            # Add forward pass for the Original network
+            _, original_output = original(global_data)
 
-            loss = d_loss + lambd_cur * reg_loss
+            # Calculate loss for the Original network
+            original_loss = dino_loss(original_output, teacher_output, epoch)
 
+            # Combine the losses
+            loss = d_loss + lambd_cur * reg_loss + original_loss
             if not math.isfinite(loss.item()):
                 raise Exception("Loss is {}, stopping training".format(loss.item()), force=True)
 
@@ -211,7 +222,16 @@ def train_one_epoch(student, teacher, dino_loss, regularized_loss, train_loader,
             utils_rdino.cancel_gradients_last_layer(epoch, student, config.freeze_last_layer)
             optimizer.step()
 
+            # Original network update
+            optimizer.zero_grad()
+            original_loss.backward()
+            optimizer.step()
             # EMA update for the teacher
+            with torch.no_grad():
+                m = momentum_schedule[it]
+                for param_q, param_k in zip(original.parameters(), teacher.parameters()):
+                    param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+
             with torch.no_grad():
                 m = momentum_schedule[it]  # momentum parameter
                 for param_q, param_k in zip(student.parameters(), teacher.parameters()):
